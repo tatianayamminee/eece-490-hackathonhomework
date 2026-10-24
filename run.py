@@ -9,9 +9,13 @@ table and a metadata JSON (file names configurable in automl/config.py).
 Task, target, number of clusters and id column may also be given on the
 command line and override the metadata.
 """
-import argparse
-import os
-import sys
+import time
+
+T_START = time.time()  # the budget counts from process start, imports included
+
+import argparse  # noqa: E402
+import os  # noqa: E402
+import sys  # noqa: E402
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -40,7 +44,8 @@ def main(argv=None):
         ap.error("give a dataset directory or --train")
     rep = run_path(a.path, out_dir=a.out, time_limit=a.time_limit, verbose=not a.quiet,
                    train=a.train, test=a.test, meta=a.meta, task=a.task, target=a.target,
-                   n_clusters=a.n_clusters, id_col=a.id_col, hard_limit=not a.no_watchdog)
+                   n_clusters=a.n_clusters, id_col=a.id_col, hard_limit=not a.no_watchdog,
+                   t_start=T_START)
     return 1 if rep.get("error") else 0
 
 

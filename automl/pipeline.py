@@ -22,32 +22,44 @@ def _log(msg):
     print(msg, file=sys.stderr, flush=True)
 
 
+def start_watchdog(t_start: float, time_limit: float, out_dir: str, task: str = "?",
+                   log=_log) -> threading.Timer:
+    """Terminate the process shortly before `time_limit` (counted from
+    `t_start`). Whatever is on disk by then is the output, so callers write the
+    fallback predictions and the profile first."""
+    def _abort():
+        write_json({"task": task, "timed_out": True,
+                    "elapsed_seconds": round(time.time() - t_start, 2)},
+                   out_dir, "run_report.json")
+        log("watchdog: time limit reached, keeping fallback outputs")
+        os._exit(0)
+    delay = max(0.5, t_start + time_limit - config.WATCHDOG_MARGIN_SECONDS - time.time())
+    watchdog = threading.Timer(delay, _abort)
+    watchdog.daemon = True
+    watchdog.start()
+    return watchdog
+
+
 def run(ds: Dataset, out_dir: str, time_limit: float | None = None, verbose=True,
-        hard_limit: bool = False) -> dict:
-    """Process one dataset. With `hard_limit`, a watchdog thread terminates the
-    process shortly before `time_limit` (the fallback predictions and the
-    profile are already on disk by then), so the limit can never be exceeded."""
-    t_start = time.time()
+        hard_limit: bool = False, t_start: float | None = None,
+        watchdog: threading.Timer | None = None) -> dict:
+    """Process one loaded dataset. The time budget counts from `t_start`
+    (process start, passed in by run.py) so loading time is included. With
+    `hard_limit` and no watchdog yet, one is started here."""
+    t_start = t_start or time.time()
     log = _log if verbose else (lambda m: None)
     time_limit = time_limit or config.TIME_LIMIT_SECONDS
     deadline = t_start + time_limit - config.SAFETY_MARGIN_SECONDS
-    watchdog = None
-    if hard_limit:
-        def _abort():
-            write_json({"task": ds.task, "timed_out": True,
-                        "elapsed_seconds": round(time.time() - t_start, 2)},
-                       out_dir, "run_report.json")
-            log("watchdog: time limit reached, keeping fallback outputs")
-            os._exit(0)
-        watchdog = threading.Timer(max(1.0, time_limit - config.WATCHDOG_MARGIN_SECONDS),
-                                   _abort)
-        watchdog.daemon = True
-        watchdog.start()
+    if hard_limit and watchdog is None:
+        watchdog = start_watchdog(t_start, time_limit, out_dir, ds.task, log)
     log(f"task={ds.task} target={ds.target} k={ds.n_clusters} "
         f"train={ds.train.shape} test={None if ds.test is None else ds.test.shape}")
 
     feats = [c for c in ds.train.columns if c != ds.target]
     X = ds.train[feats]
+    # 0. An immediate constant prediction file, before any analysis at all.
+    _write_fallback(ds, ds.train[ds.target] if ds.task != "clustering" else None,
+                    ds.test if ds.test is not None else X, None, _ids(ds), out_dir)
     # The id column is passed through to the output but never used as a feature.
     col_types, drop_info = analyse_columns(X, ds.feature_types)
     if ds.id_col and ds.id_col in X.columns and ds.id_col not in drop_info["dropped"]:
@@ -62,11 +74,7 @@ def run(ds: Dataset, out_dir: str, time_limit: float | None = None, verbose=True
         missing = [c for c in feats if c not in ds.test.columns]
         log(f"warning: test is missing columns {missing}; filling with NaN")
         X_pred = ds.test.reindex(columns=feats)
-    ids = None
-    if ds.id_col:
-        src = ds.test if ds.test is not None else ds.train
-        if ds.id_col in src.columns:
-            ids = src[ds.id_col].to_numpy()
+    ids = _ids(ds)
 
     # 1. Fallback predictions (majority class / median / quick k-means) and the
     #    profile go to disk first, so a timeout or crash never leaves no output.
@@ -113,6 +121,14 @@ def run(ds: Dataset, out_dir: str, time_limit: float | None = None, verbose=True
     return report
 
 
+def _ids(ds):
+    if ds.id_col:
+        src = ds.test if ds.test is not None else ds.train
+        if ds.id_col in src.columns:
+            return src[ds.id_col].to_numpy()
+    return None
+
+
 def _write_fallback(ds, y, X_pred, Xm, ids, out_dir):
     try:
         if ds.task == "classification":
@@ -133,6 +149,15 @@ def _write_fallback(ds, y, X_pred, Xm, ids, out_dir):
 
 
 def run_path(path=None, out_dir="output", time_limit=None, verbose=True,
-             hard_limit=False, **kw) -> dict:
+             hard_limit=False, t_start=None, **kw) -> dict:
+    """Load and run. The watchdog starts before loading so the whole run,
+    loading included, fits in the limit."""
+    t_start = t_start or time.time()
+    time_limit = time_limit or config.TIME_LIMIT_SECONDS
+    watchdog = None
+    if hard_limit:
+        watchdog = start_watchdog(t_start, time_limit, out_dir,
+                                  log=_log if verbose else (lambda m: None))
     ds = load_dataset(path, **kw)
-    return run(ds, out_dir, time_limit=time_limit, verbose=verbose, hard_limit=hard_limit)
+    return run(ds, out_dir, time_limit=time_limit, verbose=verbose, hard_limit=hard_limit,
+               t_start=t_start, watchdog=watchdog)

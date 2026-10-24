@@ -224,29 +224,33 @@ class SupervisedAutoML:
         Xs, ys = X.iloc[sel_idx].reset_index(drop=True), yv[sel_idx]
 
         n_classes = len(self.classes_) if task == "classification" else 0
-        if task == "classification" and n_classes < 2:
-            # Only one class seen: nothing to learn, always predict it.
+        self.constant_ = None
+        if (task == "classification" and n_classes < 2) or n < 4:
+            # Nothing to learn from (one class, or 1-3 rows): predict a constant.
+            if task == "classification":
+                self.constant_ = self._orig_labels[str(self.classes_[np.bincount(yv).argmax()])]
+            else:
+                self.constant_ = float(np.mean(yv))
             self.models, self.class_scale = [], None
-            self.report.update({"chosen": {"constant": 1.0}, "cv_score": None,
-                                "note": "single class in training data"})
+            self.report.update({"chosen": {"constant": 1.0}, "cv_score": None, "cv_folds": 0,
+                                "note": "single class or fewer than 4 rows: constant prediction"})
             return self
 
         # Folds are capped by the rows and by the rarest class; with too few
         # rows for any split, skip cross-validation and fit the first candidate.
         n_folds = 5 if len(Xs) <= 5000 else 3
         n_folds = min(n_folds, len(Xs) // 2)
+        stratify = False
         if task == "classification":
             min_class = int(np.bincount(ys).min())
             if min_class >= 2:
                 n_folds = min(n_folds, min_class)
-                cv = StratifiedKFold(n_folds, shuffle=True, random_state=config.RANDOM_STATE)
-            else:
-                cv = KFold(n_folds, shuffle=True, random_state=config.RANDOM_STATE)
-        else:
-            cv = KFold(n_folds, shuffle=True, random_state=config.RANDOM_STATE)
+                stratify = True
         if n_folds < 2 or len(Xs) < 8:
-            folds = []
+            n_folds, folds = 0, []          # too small for any cross-validation
         else:
+            cv = (StratifiedKFold if stratify else KFold)(
+                n_folds, shuffle=True, random_state=config.RANDOM_STATE)
             folds = list(cv.split(Xs, ys))
 
         can_log = task == "regression" and ys.min() >= 0
@@ -419,9 +423,9 @@ class SupervisedAutoML:
         return scale if best > base + 0.002 else None
 
     def predict(self, X: pd.DataFrame):
-        if not self.models:  # single-class training data
-            v = self._orig_labels[str(self.classes_[0])]
-            return np.full(len(X), v, dtype=object)
+        if not self.models:  # constant prediction (see fit)
+            return np.full(len(X), self.constant_,
+                           dtype=object if self.task == "classification" else float)
         out = None
         for fm, w in self.models:
             p = fm.predict_raw(X, self.task)

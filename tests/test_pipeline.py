@@ -171,6 +171,20 @@ def test_single_class_and_rare_class(tmp_path):
     assert len(preds) == 20
 
 
+def test_one_to_three_training_rows(tmp_path):
+    for n in (1, 2, 3):
+        df = pd.DataFrame({"x": np.arange(n, dtype=float), "y": np.arange(n) * 2.0})
+        test = pd.DataFrame({"x": [1.0, 2.0]})
+        d = tmp_path / f"n{n}"
+        d.mkdir()
+        rep, preds, _ = _run(d, df, test, {"task": "regression", "target": "y"})
+        assert len(preds) == 2 and np.isfinite(preds["prediction"]).all()
+    df = pd.DataFrame({"x": [0.0, 1.0], "y": ["a", "b"]})
+    (tmp_path / "c").mkdir()
+    rep, preds, _ = _run(tmp_path / "c", df, test, {"task": "classification", "target": "y"})
+    assert len(preds) == 2
+
+
 def test_too_few_rows_for_cv(tmp_path):
     df = pd.DataFrame({"x": rng.normal(size=12)})
     df["y"] = 2 * df["x"]

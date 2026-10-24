@@ -124,8 +124,8 @@ scored with stratified 5-fold cross-validation (3-fold above 5k rows; model
 selection uses a 20k-row subsample on larger data) producing out-of-fold
 predictions. The number of folds is capped by the row count and by the rarest
 class; a class with a single example falls back to unstratified folds, and
-with fewer than 8 rows cross-validation is skipped and the first candidate is
-fit directly. Before each candidate we project its cost from the first fold
+with fewer than 8 rows (down to a single row) cross-validation is skipped and
+the first candidate is fit directly. Before each candidate we project its cost from the first fold
 and skip it when it would not fit in the remaining budget, always reserving
 time for the final refit of the best model on all rows.
 
@@ -155,8 +155,8 @@ index) with the other candidates. Cluster ids are renumbered by size.
    would not fit are skipped, time for the final refit is reserved, LightGBM
    stops boosting when the deadline passes (keeping the trees built so far)
    and forests grow in chunks of 50 trees with the same check.
-3. A watchdog thread terminates the process 2 s before the limit
-   (`--no-watchdog` disables it). Because of layer 1, the outputs on disk are
+3. A watchdog thread, started at process launch before any data is loaded,
+   terminates the process 2 s before the limit (`--no-watchdog` disables it). Because of layer 1, the outputs on disk are
    then the fallback or the last complete predictions, never a partial file.
 
 Typical runtime on 4 CPU cores: 2–3 s for clustering, 25–40 s for supervised
