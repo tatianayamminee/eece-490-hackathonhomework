@@ -43,7 +43,8 @@ WRITE_ID_COLUMN = True             # include the id column when one exists
 
 # ---------------------------------------------------------------- time budget
 TIME_LIMIT_SECONDS = 60.0
-SAFETY_MARGIN_SECONDS = 10.0       # reserved for loading, profiling and writing
+SAFETY_MARGIN_SECONDS = 10.0       # modelling stops this long before the limit
+WATCHDOG_MARGIN_SECONDS = 2.0      # process is terminated this long before the limit
 
 # -------------------------------------------------------------- metric guesses
 # Used for internal model selection only. Swap once the scoring rules are known.

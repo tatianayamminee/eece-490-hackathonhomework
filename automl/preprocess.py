@@ -21,11 +21,11 @@ def analyse_columns(X: pd.DataFrame, hints: dict | None = None):
     """Column types plus which columns to drop and why (fit on training data)."""
     types = infer_column_types(X, hints)
     constant, id_like = [], []
-    for c in X.columns:
+    for pos, c in enumerate(X.columns):
         nun = X[c].nunique(dropna=True)
         if nun <= 1 and not (nun == 1 and X[c].isna().any()):
             constant.append(c)
-        elif is_id_like(X[c], c, types[c]) and not (hints or {}).get(c):
+        elif is_id_like(X[c], c, types[c], pos) and not (hints or {}).get(c):
             id_like.append(c)
     rest = X[[c for c in X.columns if c not in constant and c not in id_like]]
     duplicate = find_duplicate_columns(rest)

@@ -37,16 +37,21 @@ def main():
             continue
         out = os.path.join(a.out, name)
         t0 = time.time()
-        proc = subprocess.run([sys.executable, os.path.join(ROOT, "run.py"), d, "--out", out,
-                               "--time-limit", str(a.time_limit), "--quiet"],
-                              capture_output=True, text=True, timeout=a.time_limit + 30)
+        try:  # the limit is enforced here exactly as an assessor would
+            proc = subprocess.run([sys.executable, os.path.join(ROOT, "run.py"), d, "--out",
+                                   out, "--time-limit", str(a.time_limit), "--quiet"],
+                                  capture_output=True, text=True, timeout=a.time_limit)
+            rc, err = proc.returncode, proc.stderr
+        except subprocess.TimeoutExpired as e:
+            rc, err = "TIMEOUT", (e.stderr or b"").decode(errors="replace") \
+                if isinstance(e.stderr, bytes) else (e.stderr or "")
         el = time.time() - t0
-        row = {"dataset": name, "seconds": round(el, 1), "rc": proc.returncode,
-               "within_limit": el <= a.time_limit,
+        row = {"dataset": name, "seconds": round(el, 1), "rc": rc,
+               "within_limit": el <= a.time_limit and rc != "TIMEOUT",
                "profile": os.path.exists(os.path.join(out, "profile.json")),
                "preds": os.path.exists(os.path.join(out, "predictions.csv"))}
-        if proc.returncode or not row["preds"]:
-            row["stderr"] = proc.stderr[-800:]
+        if rc or not row["preds"]:
+            row["stderr"] = err[-800:]
         try:
             rep = json.load(open(os.path.join(out, "run_report.json")))
             row["chosen"] = rep.get("chosen")
@@ -78,6 +83,12 @@ def main():
     df = pd.DataFrame(rows)
     pd.set_option("display.width", 200)
     print("\n" + df.drop(columns=["stderr"], errors="ignore").to_string(index=False))
+    ok = bool(df["within_limit"].all() and df["preds"].all() and df["profile"].all()
+              and (df["rc"] == 0).all())
+    print(f"\n{'PASS' if ok else 'FAIL'}: {int(df['within_limit'].sum())}/{len(df)} datasets "
+          f"within {a.time_limit:.0f}s with predictions and profile, "
+          f"{int((df['rc'] == 0).sum())}/{len(df)} without modelling errors")
+    sys.exit(0 if ok else 1)
 
 
 if __name__ == "__main__":

@@ -114,25 +114,38 @@ def find_duplicate_columns(df: pd.DataFrame) -> dict:
     return dups
 
 
-def is_id_like(s: pd.Series, name: str, ctype: str) -> bool:
+_HEX_ID = re.compile(r"^[0-9a-fA-F-]{16,}$")
+
+
+def is_id_like(s: pd.Series, name: str, ctype: str, position: int = -1) -> bool:
+    """Conservative identifier detection. A declared id column is handled by
+    the caller; here a column is an id only with two pieces of evidence:
+    unique values AND (an id-style name, or a 0/1-based consecutive integer
+    sequence in the first column, or uuid/hash-like strings)."""
     n = len(s)
     if n < 20 or s.isna().any():
         return False
     nun = s.nunique()
-    lname = name.lower()
-    named = lname in {"id", "index", "row_id", "rowid", "uid", "uuid", "key"} or \
-        lname.endswith(("_id", "id")) and len(lname) <= 20
+    if nun != n:
+        return False
+    lname = name.lower().strip()
+    named = lname in {"id", "index", "idx", "row_id", "rowid", "row", "uid", "uuid",
+                      "key", "guid", "record_id", "customer_id", "user_id"} or (
+        (lname.endswith("_id") or lname.endswith("id")) and len(lname) <= 24)
     if ctype == "numeric":
-        if nun != n:
-            return False
+        if named:
+            return True
         v = to_numeric_clean(s).to_numpy()
         if not np.all(np.isfinite(v)) or not np.all(np.mod(v, 1) == 0):
             return False
-        d = np.diff(np.sort(v))
-        consecutive = d.size > 0 and np.all(d == 1)
-        return consecutive or named
+        sv = np.sort(v)
+        consecutive = sv.size > 1 and np.all(np.diff(sv) == 1) and sv[0] in (0, 1)
+        return bool(consecutive and position == 0)
     if ctype in ("categorical", "text"):
-        return nun == n or (named and nun > 0.95 * n)
+        if named:
+            return True
+        sample = s.astype(str).head(200)
+        return bool(sample.str.match(_HEX_ID).mean() > 0.95)
     return False
 
 

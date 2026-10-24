@@ -42,23 +42,28 @@ def _lgbm(task, **kw):
     return lgb.LGBMClassifier(**base) if task == "classification" else lgb.LGBMRegressor(**base)
 
 
-def candidate_models(task: str, n: int, p: int, n_classes: int = 0, imbalanced=False):
-    """Ordered list of (name, preprocessing mode, estimator, log_target)."""
+def candidate_models(task: str, n: int, p: int, n_classes: int = 0, imbalanced=False,
+                     budget: float = 1e9):
+    """Ordered list of (name, preprocessing mode, estimator, log_target). With a
+    small time budget the boosting / forest candidates are made cheaper up front."""
     small = n <= 3000
+    quick = budget < 30 or n * p > 4e6
+    lgb_kw = dict(n_estimators=150, learning_rate=0.1) if quick else {}
+    n_trees = 100 if quick else 300
     c = []
     if task == "classification":
-        c.append(("lgbm", "tree", _lgbm(task), False))
+        c.append(("lgbm", "tree", _lgbm(task, **lgb_kw), False))
         c.append(("logreg", "linear", LogisticRegression(C=1.0, max_iter=2000), False))
         if imbalanced:
-            c.append(("lgbm_balanced", "tree", _lgbm(task, class_weight="balanced"), False))
+            c.append(("lgbm_balanced", "tree", _lgbm(task, class_weight="balanced", **lgb_kw), False))
             c.append(("logreg_balanced", "linear",
                       LogisticRegression(C=1.0, max_iter=2000, class_weight="balanced"), False))
         c.append(("extra_trees", "tree", ExtraTreesClassifier(
-            n_estimators=300, min_samples_leaf=1, max_features="sqrt", n_jobs=N_JOBS,
+            n_estimators=n_trees, min_samples_leaf=1, max_features="sqrt", n_jobs=N_JOBS,
             random_state=config.RANDOM_STATE,
             class_weight="balanced_subsample" if imbalanced else None), False))
         c.append(("random_forest", "tree", RandomForestClassifier(
-            n_estimators=300, max_features="sqrt", n_jobs=N_JOBS,
+            n_estimators=n_trees, max_features="sqrt", n_jobs=N_JOBS,
             random_state=config.RANDOM_STATE,
             class_weight="balanced_subsample" if imbalanced else None), False))
         c.append(("lgbm_slow", "tree", _lgbm(task, n_estimators=1000, learning_rate=0.02,
@@ -71,14 +76,14 @@ def candidate_models(task: str, n: int, p: int, n_classes: int = 0, imbalanced=F
             c.append(("knn", "linear", KNeighborsClassifier(
                 n_neighbors=15, weights="distance", n_jobs=N_JOBS), False))
     else:
-        c.append(("lgbm", "tree", _lgbm(task), False))
+        c.append(("lgbm", "tree", _lgbm(task, **lgb_kw), False))
         c.append(("ridge", "linear", RidgeCV(alphas=np.logspace(-3, 3, 13)), False))
-        c.append(("lgbm_logy", "tree", _lgbm(task), True))
+        c.append(("lgbm_logy", "tree", _lgbm(task, **lgb_kw), True))
         c.append(("extra_trees", "tree", ExtraTreesRegressor(
-            n_estimators=300, max_features=0.7, n_jobs=N_JOBS,
+            n_estimators=n_trees, max_features=0.7, n_jobs=N_JOBS,
             random_state=config.RANDOM_STATE), False))
         c.append(("random_forest", "tree", RandomForestRegressor(
-            n_estimators=300, max_features=0.5, n_jobs=N_JOBS,
+            n_estimators=n_trees, max_features=0.5, n_jobs=N_JOBS,
             random_state=config.RANDOM_STATE), False))
         c.append(("lgbm_slow", "tree", _lgbm(task, n_estimators=1000, learning_rate=0.02,
                                               num_leaves=15), False))
@@ -123,19 +128,52 @@ def score(task: str, y_true, pred, proba=None, metric: str | None = None) -> flo
 
 
 # ---------------------------------------------------------------- fitting
-class FittedModel:
-    """Preprocessor + estimator (+ optional log target), fit on raw frames."""
+def _lgb_deadline_callback(deadline: float):
+    """Stop boosting when the deadline passes; the trees built so far are kept."""
+    import lightgbm as lgb
 
-    def __init__(self, mode, est, log_target, col_types, drop_info, hints):
+    def cb(env):
+        if env.iteration >= 20 and time.time() > deadline:
+            raise lgb.callback.EarlyStopException(env.iteration, env.evaluation_result_list)
+    cb.order = 30
+    return cb
+
+
+_FORESTS = (RandomForestClassifier, RandomForestRegressor,
+            ExtraTreesClassifier, ExtraTreesRegressor)
+
+
+class FittedModel:
+    """Preprocessor + estimator (+ optional log target), fit on raw frames.
+
+    Training respects `deadline`: LightGBM stops boosting when it passes and
+    forests grow in chunks of trees, so a slow fit degrades instead of
+    overrunning the time limit."""
+
+    def __init__(self, mode, est, log_target, col_types, drop_info, hints,
+                 deadline: float | None = None):
         self.pre = Preprocessor(mode=mode, hints=hints, col_types=col_types,
                                 drop_info=drop_info)
         self.est = clone(est)
         self.log_target = log_target
+        self.deadline = deadline
 
     def fit(self, X, y):
         Xm = self.pre.fit_transform(X)
         yt = np.log1p(y) if self.log_target else y
-        self.est.fit(Xm, yt)
+        est = self.est
+        if self.deadline is not None and type(est).__name__.startswith("LGBM"):
+            est.fit(Xm, yt, callbacks=[_lgb_deadline_callback(self.deadline)])
+        elif self.deadline is not None and isinstance(est, _FORESTS):
+            total, step = est.n_estimators, 50
+            est.set_params(warm_start=True, n_estimators=min(step, total))
+            est.fit(Xm, yt)
+            while est.n_estimators < total and time.time() < self.deadline:
+                est.set_params(n_estimators=min(est.n_estimators + step, total))
+                est.fit(Xm, yt)
+            est.set_params(warm_start=False)
+        else:
+            est.fit(Xm, yt)
         return self
 
     def predict_raw(self, X, task):
@@ -185,19 +223,45 @@ class SupervisedAutoML:
             sel_idx = np.sort(rs.choice(n, 20000, replace=False))
         Xs, ys = X.iloc[sel_idx].reset_index(drop=True), yv[sel_idx]
 
+        n_classes = len(self.classes_) if task == "classification" else 0
+        if task == "classification" and n_classes < 2:
+            # Only one class seen: nothing to learn, always predict it.
+            self.models, self.class_scale = [], None
+            self.report.update({"chosen": {"constant": 1.0}, "cv_score": None,
+                                "note": "single class in training data"})
+            return self
+
+        # Folds are capped by the rows and by the rarest class; with too few
+        # rows for any split, skip cross-validation and fit the first candidate.
         n_folds = 5 if len(Xs) <= 5000 else 3
+        n_folds = min(n_folds, len(Xs) // 2)
         if task == "classification":
-            min_class = np.bincount(ys).min()
-            n_folds = max(2, min(n_folds, int(min_class)))
-            cv = StratifiedKFold(n_folds, shuffle=True, random_state=config.RANDOM_STATE)
+            min_class = int(np.bincount(ys).min())
+            if min_class >= 2:
+                n_folds = min(n_folds, min_class)
+                cv = StratifiedKFold(n_folds, shuffle=True, random_state=config.RANDOM_STATE)
+            else:
+                cv = KFold(n_folds, shuffle=True, random_state=config.RANDOM_STATE)
         else:
             cv = KFold(n_folds, shuffle=True, random_state=config.RANDOM_STATE)
-        folds = list(cv.split(Xs, ys))
-        n_classes = len(self.classes_) if task == "classification" else 0
+        if n_folds < 2 or len(Xs) < 8:
+            folds = []
+        else:
+            folds = list(cv.split(Xs, ys))
 
         can_log = task == "regression" and ys.min() >= 0
-        cands = [c for c in candidate_models(task, len(Xs), p, n_classes, imbalanced)
+        cands = [c for c in candidate_models(task, len(Xs), p, n_classes, imbalanced,
+                                             budget=self.remaining())
                  if not (c[3] and not can_log)]
+
+        if not folds:
+            name, mode, est, logy = cands[0]
+            fm = FittedModel(mode, est, logy, self.col_types, self.drop_info, self.hints,
+                             deadline=self.deadline).fit(X, yv)
+            self.models, self.class_scale = [(fm, 1.0)], None
+            self.report.update({"chosen": {name: 1.0}, "cv_score": None, "cv_folds": 0,
+                                "note": "too few rows for cross-validation"})
+            return self
 
         oofs, results = {}, []
         scale_up = n / max(len(Xs), 1)
@@ -214,7 +278,8 @@ class SupervisedAutoML:
             ok = True
             for i, (tr, va) in enumerate(folds):
                 try:
-                    fm = FittedModel(mode, est, logy, self.col_types, self.drop_info, self.hints)
+                    fm = FittedModel(mode, est, logy, self.col_types, self.drop_info,
+                                     self.hints, deadline=self.deadline - refit_reserve)
                     fm.fit(Xs.iloc[tr], ys[tr])
                     pr = fm.predict_raw(Xs.iloc[va], task)
                     if task == "classification":
@@ -246,7 +311,18 @@ class SupervisedAutoML:
             refit_reserve = best_so_far["fit_seconds"] * 1.5 * scale_up
 
         if not results:
-            raise RuntimeError("no candidate finished in time")
+            # Last resort: a quick model on a sample, truncated by the deadline
+            # callback; still better than the constant fallback.
+            name, mode, est, logy = cands[0]
+            if type(est).__name__.startswith("LGBM"):
+                est = clone(est).set_params(n_estimators=60, learning_rate=0.15)
+            sub = X.sample(min(n, 5000), random_state=config.RANDOM_STATE)
+            fm = FittedModel(mode, est, logy, self.col_types, self.drop_info, self.hints,
+                             deadline=self.deadline + 3).fit(sub, yv[sub.index])
+            self.models, self.class_scale = [(fm, 1.0)], None
+            self.report.update({"chosen": {name + "_quick": 1.0}, "cv_score": None,
+                                "note": "no candidate fit in the budget; quick fit on a sample"})
+            return self
         results.sort(key=lambda r: -r["cv_score"])
         self.report["candidates"] = [{k: v for k, v in r.items() if k != "est"}
                                      for r in results]
@@ -289,7 +365,7 @@ class SupervisedAutoML:
                 self.log(f"  refit {name} skipped for time")
                 continue
             fm = FittedModel(r["mode"], r["est"], r["log_target"], self.col_types,
-                             self.drop_info, self.hints).fit(X, yv)
+                             self.drop_info, self.hints, deadline=self.deadline).fit(X, yv)
             self.models.append((fm, w))
         tot = sum(w for _, w in self.models)
         self.models = [(m, w / tot) for m, w in self.models]
@@ -343,6 +419,9 @@ class SupervisedAutoML:
         return scale if best > base + 0.002 else None
 
     def predict(self, X: pd.DataFrame):
+        if not self.models:  # single-class training data
+            v = self._orig_labels[str(self.classes_[0])]
+            return np.full(len(X), v, dtype=object)
         out = None
         for fm, w in self.models:
             p = fm.predict_raw(X, self.task)

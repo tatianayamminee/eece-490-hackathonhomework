@@ -132,3 +132,69 @@ def test_metadata_variants(tmp_path):
     ds = load_dataset(str(d))
     assert ds.task == "classification" and ds.target == "label"
     assert ds.feature_types["cat_dup"] == "categorical"
+
+
+def test_id_detection_is_conservative():
+    n = 100
+    df = pd.DataFrame({
+        "age_rank": np.arange(1, n + 1),            # consecutive but not first column
+        "customer_id": rng.permutation(n) + 5000,   # named id, unique
+        "score": rng.normal(size=n),
+        "token": [f"{i:032x}" for i in rng.permutation(n)],  # hash-like strings
+    })
+    df.insert(0, "idx", np.arange(n))               # consecutive, first column
+    _, drop = analyse_columns(df)
+    assert set(drop["id_like"]) == {"idx", "customer_id", "token"}
+    assert "age_rank" not in drop["dropped"]
+
+
+def test_declared_id_column_is_respected(tmp_path):
+    n = 120
+    df = pd.DataFrame({"x": rng.normal(size=n), "ref": rng.permutation(n) + 10})
+    df["y"] = (df["x"] > 0).astype(int)
+    rep, preds, prof = _run(tmp_path, df.iloc[:90], df.iloc[90:].drop(columns="y"),
+                            {"task": "classification", "target": "y", "id": "ref"})
+    assert list(preds.columns) == ["ref", "prediction"]
+    assert "ref" in prof["summary"]["id_like_columns"]
+
+
+def test_single_class_and_rare_class(tmp_path):
+    df = pd.DataFrame({"x": rng.normal(size=60), "y": 1})
+    rep, preds, _ = _run(tmp_path, df.iloc[:40], df.iloc[40:].drop(columns="y"),
+                         {"task": "classification", "target": "y"})
+    assert (preds["prediction"] == 1).all()
+    df["y"] = 0
+    df.loc[3, "y"] = 1                               # one positive example only
+    (tmp_path / "b").mkdir()
+    rep, preds, _ = _run(tmp_path / "b", df.iloc[:40], df.iloc[40:].drop(columns="y"),
+                         {"task": "classification", "target": "y"})
+    assert len(preds) == 20
+
+
+def test_too_few_rows_for_cv(tmp_path):
+    df = pd.DataFrame({"x": rng.normal(size=12)})
+    df["y"] = 2 * df["x"]
+    rep, preds, _ = _run(tmp_path, df.iloc[:6], df.iloc[6:].drop(columns="y"),
+                         {"task": "regression", "target": "y"})
+    assert rep.get("cv_folds") == 0 and len(preds) == 6
+
+
+def test_watchdog_keeps_fallback_outputs(tmp_path):
+    """A hard time limit terminates the run with valid fallback files on disk."""
+    import subprocess
+    n = 6000
+    X = rng.normal(size=(n, 40))
+    df = pd.DataFrame(X, columns=[f"f{i}" for i in range(40)])
+    df["y"] = (X[:, :5].sum(1) > 0).astype(int)
+    d = tmp_path / "ds"
+    d.mkdir()
+    df.to_csv(d / "train.csv", index=False)
+    (d / "metadata.json").write_text(json.dumps({"task": "classification", "target": "y"}))
+    out = tmp_path / "out"
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    t0 = __import__("time").time()
+    subprocess.run([sys.executable, os.path.join(root, "run.py"), str(d), "--out", str(out),
+                    "--time-limit", "6", "--quiet"], timeout=20)
+    assert __import__("time").time() - t0 < 8
+    assert (out / "predictions.csv").exists() and (out / "profile.json").exists()
+    assert len(pd.read_csv(out / "predictions.csv")) == n

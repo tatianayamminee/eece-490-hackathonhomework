@@ -33,12 +33,14 @@ def main(argv=None):
     ap.add_argument("--out", default="output")
     ap.add_argument("--time-limit", type=float, default=config.TIME_LIMIT_SECONDS)
     ap.add_argument("--quiet", action="store_true")
+    ap.add_argument("--no-watchdog", action="store_true",
+                    help="do not terminate the process at the time limit")
     a = ap.parse_args(argv)
     if not (a.path or a.train):
         ap.error("give a dataset directory or --train")
     rep = run_path(a.path, out_dir=a.out, time_limit=a.time_limit, verbose=not a.quiet,
                    train=a.train, test=a.test, meta=a.meta, task=a.task, target=a.target,
-                   n_clusters=a.n_clusters, id_col=a.id_col)
+                   n_clusters=a.n_clusters, id_col=a.id_col, hard_limit=not a.no_watchdog)
     return 1 if rep.get("error") else 0
 
 

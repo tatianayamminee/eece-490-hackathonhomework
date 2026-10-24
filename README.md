@@ -11,7 +11,8 @@ inspects the data, chooses its own preprocessing and model within a
 
 ```bash
 python -m venv .venv && source .venv/bin/activate   # Python 3.10+ (tested on 3.13)
-pip install -r requirements.txt                      # pinned versions
+pip install -r requirements.txt                      # pinned runtime versions
+pip install -r requirements-dev.txt                  # adds pytest (tests only)
 
 # Standard entry point: a dataset directory holding train.csv, test.csv, metadata.json
 python run.py path/to/dataset --out output/dataset_name
@@ -33,9 +34,13 @@ Outputs written to `--out`:
 
 ```bash
 python tools/make_synthetic.py data/synthetic      # 8 messy synthetic datasets with hidden labels
-python tools/check.py data/synthetic               # runs run.py on each and scores the outputs
-python -m pytest tests -q                           # fast unit + end-to-end tests (~1 min)
+python tools/check.py data/synthetic               # runs run.py on each, enforces 60 s, scores
+python -m pytest tests -q                           # unit + end-to-end tests (~1.5 min)
 ```
+
+`tools/check.py` kills a run that reaches the time limit, exactly as an
+assessor would, and exits non-zero unless every dataset produced
+`predictions.csv` and `profile.json` within the limit.
 
 ## Input contract and assumptions
 
@@ -66,9 +71,10 @@ contract is a few constant changes, not code changes. Current assumptions:
   candidate models; change `CLASSIFICATION_METRIC` / `REGRESSION_METRIC` in
   `config.py` if the published scoring uses something else (accuracy, ROC-AUC,
   log loss, MAE, R2 and RMSLE are implemented).
-* A valid `predictions.csv` (majority class / median) and `profile.json` are
-  written in the first seconds, so a timeout or a modelling crash never leaves
-  the dataset without output. All writes are atomic.
+* A valid `predictions.csv` (majority class / median / quick k-means labels)
+  and `profile.json` are written in the first seconds, so a timeout or a
+  modelling crash never leaves the dataset without output. All writes are
+  atomic (write to a temp file, then rename).
 
 ## Approach
 
@@ -80,8 +86,10 @@ missing tokens (`?`, `NA`, `-`, `null`, ...), and detecting dates. We then flag
 
 * constant columns (dropped),
 * duplicate columns, exact or equal up to relabelling of values (dropped),
-* id-like columns: unique integer sequences or uniquely-valued columns with an
-  id-style name (dropped),
+* id-like columns (dropped): the id column declared in the metadata, else a
+  column that is unique **and** either has an id-style name, is a 0/1-based
+  consecutive integer sequence in the first column, or holds uuid/hash-like
+  strings. Uniqueness alone never drops a feature.
 * missingness per column, scale spread between numeric columns, skewness,
   outlier fraction, high-cardinality categoricals, strongly correlated pairs,
   duplicate rows,
@@ -114,9 +122,12 @@ imbalanced, extra-trees, random forest, a slower LightGBM, a log-target
 variant for skewed regression targets, and SVM / kNN on small data. Each is
 scored with stratified 5-fold cross-validation (3-fold above 5k rows; model
 selection uses a 20k-row subsample on larger data) producing out-of-fold
-predictions. Before each candidate we project its cost from the first fold and
-skip it when it would not fit in the remaining budget, always reserving time
-for the final refit of the best model on all rows.
+predictions. The number of folds is capped by the row count and by the rarest
+class; a class with a single example falls back to unstratified folds, and
+with fewer than 8 rows cross-validation is skipped and the first candidate is
+fit directly. Before each candidate we project its cost from the first fold
+and skip it when it would not fit in the remaining budget, always reserving
+time for the final refit of the best model on all rows.
 
 The out-of-fold predictions feed a greedy (Caruana-style) ensemble; it
 replaces the best single model only when it improves the cross-validated
@@ -137,12 +148,21 @@ unequal clusters) and Ward linkage. The final partition maximises a rank
 average of silhouette on the selected features and agreement (adjusted Rand
 index) with the other candidates. Cluster ids are renumbered by size.
 
-### 5. Speed
+### 5. The 60-second limit, in layers
 
-Typical runtime on 4 CPU cores: 2 s for clustering, 20–35 s for supervised
+1. Fallback predictions and the profile are on disk within the first seconds.
+2. Modelling works against a deadline 10 s before the limit: candidates that
+   would not fit are skipped, time for the final refit is reserved, LightGBM
+   stops boosting when the deadline passes (keeping the trees built so far)
+   and forests grow in chunks of 50 trees with the same check.
+3. A watchdog thread terminates the process 2 s before the limit
+   (`--no-watchdog` disables it). Because of layer 1, the outputs on disk are
+   then the fallback or the last complete predictions, never a partial file.
+
+Typical runtime on 4 CPU cores: 2–3 s for clustering, 25–40 s for supervised
 datasets of a few thousand rows, ~45 s for 40–60k rows (the budget adapts to
-the machine: slower CPUs simply try fewer candidates). The 60 s limit and a
-10 s safety margin are in `config.py`.
+the machine: slower CPUs simply try fewer candidates). All margins are in
+`config.py`.
 
 ## Results on our synthetic datasets
 
@@ -174,11 +194,18 @@ automl/clustering.py   feature selection, candidate partitions, selection
 automl/pipeline.py     orchestration for one dataset
 tools/make_synthetic.py  messy synthetic datasets with hidden labels
 tools/check.py           local checker: runs and scores every dataset in a folder
-tests/                   pytest suite
+tests/                   pytest suite (pip install -r requirements-dev.txt)
 ```
 
 ## Dependencies
 
 Pinned in `requirements.txt`: numpy 2.2.6, pandas 2.2.3, scipy 1.15.3,
 scikit-learn 1.6.1, lightgbm 4.6.0. CPU only; no network access needed at
-run time.
+run time. `requirements-dev.txt` adds pytest 8.3.4 for the test suite.
+
+## Still open until kickoff
+
+The exact file names, metadata keys, prediction file layout and profile
+structure of the official contract, and the official checker. All of these
+are constants in `automl/config.py`; the profile keys live in
+`automl/profile.py` (`build_profile`).
